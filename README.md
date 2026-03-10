@@ -1,6 +1,6 @@
 # Image Resize & Augmentation Pipeline
 
-Preprocessing CLI for segmentation datasets. Resize, rotate, and augment images using only Pillow + NumPy.
+Preprocessing CLI for segmentation datasets. Resize, tile, crop ROI, rotate, and augment images using only Pillow + NumPy.
 
 ## Folder Structure
 
@@ -14,18 +14,48 @@ Supported formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.webp`
 ## Installation
 
 ```bash
-pip install Pillow numpy
+pip install -r requirements.txt
 ```
 
 ## Commands
 
-### Resize
+### Tile (Strategy 1 – Best for preserving detail)
 
-Resize all images to target dimensions.
+Slice large images into overlapping patches at native resolution. No downsampling — the model trains on uncompressed pixels.
+
+```bash
+python resize.py tile <patch_width> <patch_height>
+python resize.py tile 1024 1024 --overlap 0.15
+```
+
+- `--overlap` — fraction of overlap between adjacent tiles, 0.0–0.5 (default: 0.15)
+- Edge patches are automatically included so no pixels are lost
+- Output filenames: `{name}_tile{i}.png`
+
+### ROI Crop (Strategy 2 – Reduce background, keep detail)
+
+Crop to a region of interest (manually or auto-detected), then resize. Useful when the subject occupies a small portion of the frame.
+
+```bash
+python resize.py roi <width> <height>
+python resize.py roi 1024 1024 --box 500 500 2000 2000
+python resize.py roi 1024 1024 --interpolation bicubic
+```
+
+- `--box X Y W H` — manual ROI coordinates. If omitted, foreground is auto-detected from corner background color
+- `--interpolation` — `lanczos` (default) or `bicubic`
+- Output filenames: `{name}_roi.png`
+
+### Resize (Strategy 3 – Full-image resize)
+
+Resize all images to target dimensions with explicit high-quality interpolation (never nearest-neighbor).
 
 ```bash
 python resize.py resize <width> <height>
+python resize.py resize 1024 1024 --interpolation lanczos
 ```
+
+- `--interpolation` — `lanczos` (default) or `bicubic`
 
 ### Rotate
 
@@ -33,11 +63,6 @@ Rotate all images by a fixed angle and resize to target dimensions.
 
 ```bash
 python resize.py rotate <width> <height> <angle>
-```
-
-Example:
-
-```bash
 python resize.py rotate 512 512 30
 python resize.py rotate 512 512 -15
 ```

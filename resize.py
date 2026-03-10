@@ -72,12 +72,19 @@ ALL_AUGMENTATIONS = [
 ]
 
 
+INTERPOLATION_METHODS = {
+    "lanczos": Image.LANCZOS,
+    "bicubic": Image.BICUBIC,
+}
+
+
 # ---------------------------------------------------------------------------
-# Subcommand: resize
+# Subcommand: resize (Strategy 3 – full-image resize with explicit interp)
 # ---------------------------------------------------------------------------
 
 def cmd_resize(args):
     target_w, target_h = args.width, args.height
+    interp = INTERPOLATION_METHODS[args.interpolation]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     files = get_image_files(INPUT_DIR)
@@ -85,14 +92,133 @@ def cmd_resize(args):
         print(f"No images found in '{INPUT_DIR}/'")
         return
 
-    print(f"Resizing {len(files)} image(s) to {target_w}x{target_h} ...")
+    print(f"Resizing {len(files)} image(s) to {target_w}x{target_h} ({args.interpolation}) ...")
 
     for filename in files:
         img = Image.open(os.path.join(INPUT_DIR, filename)).convert("RGB")
-        resized = img.resize((target_w, target_h), Image.LANCZOS)
+        resized = img.resize((target_w, target_h), interp)
         out_name = f"{stem(filename)}.png"
         resized.save(os.path.join(OUTPUT_DIR, out_name))
         print(f"  {filename}  {img.size[0]}x{img.size[1]} -> {target_w}x{target_h}")
+
+    print("Done.")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: tile (Strategy 1 – overlapping patches at native resolution)
+# ---------------------------------------------------------------------------
+
+def cmd_tile(args):
+    patch_w, patch_h = args.width, args.height
+    overlap = args.overlap
+    stride_w = int(patch_w * (1 - overlap))
+    stride_h = int(patch_h * (1 - overlap))
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    files = get_image_files(INPUT_DIR)
+    if not files:
+        print(f"No images found in '{INPUT_DIR}/'")
+        return
+
+    print(f"Tiling {len(files)} image(s) into {patch_w}x{patch_h} patches "
+          f"(overlap {overlap:.0%}, stride {stride_w}x{stride_h}) ...")
+
+    total_patches = 0
+    for filename in files:
+        img = Image.open(os.path.join(INPUT_DIR, filename)).convert("RGB")
+        img_w, img_h = img.size
+        name = stem(filename)
+        patch_idx = 0
+
+        y = 0
+        while y + patch_h <= img_h:
+            x = 0
+            while x + patch_w <= img_w:
+                patch = img.crop((x, y, x + patch_w, y + patch_h))
+                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
+                patch_idx += 1
+                x += stride_w
+            # right-edge patch if the image doesn't divide evenly
+            if x < img_w and (x - stride_w + patch_w) < img_w:
+                patch = img.crop((img_w - patch_w, y, img_w, y + patch_h))
+                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
+                patch_idx += 1
+            y += stride_h
+        # bottom-edge row
+        if y < img_h and (y - stride_h + patch_h) < img_h:
+            x = 0
+            while x + patch_w <= img_w:
+                patch = img.crop((x, img_h - patch_h, x + patch_w, img_h))
+                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
+                patch_idx += 1
+                x += stride_w
+            if x < img_w and (x - stride_w + patch_w) < img_w:
+                patch = img.crop((img_w - patch_w, img_h - patch_h, img_w, img_h))
+                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
+                patch_idx += 1
+
+        total_patches += patch_idx
+        print(f"  {filename} ({img_w}x{img_h}) -> {patch_idx} tiles")
+
+    print(f"Done. {total_patches} tiles written to '{OUTPUT_DIR}/'.")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: roi (Strategy 2 – crop to ROI then resize)
+# ---------------------------------------------------------------------------
+
+def _auto_detect_roi(img, threshold=10):
+    """Detect bounding box of non-background content.
+
+    Assumes the background is near-black or near-white at the image edges.
+    Falls back to the full image if detection fails.
+    """
+    arr = np.array(img)
+    # sample corner pixels to estimate background color
+    corners = [arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]
+    bg = np.mean(corners, axis=0)
+    # mask of pixels that differ from the background
+    diff = np.linalg.norm(arr.astype(np.float32) - bg.astype(np.float32), axis=2)
+    mask = diff > threshold
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return 0, 0, img.size[0], img.size[1]
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+    return int(x_min), int(y_min), int(x_max + 1), int(y_max + 1)
+
+
+def cmd_roi(args):
+    target_w, target_h = args.width, args.height
+    interp = INTERPOLATION_METHODS[args.interpolation]
+    box = args.box
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    files = get_image_files(INPUT_DIR)
+    if not files:
+        print(f"No images found in '{INPUT_DIR}/'")
+        return
+
+    mode = "manual" if box else "auto-detect"
+    print(f"ROI crop ({mode}) + resize to {target_w}x{target_h} for {len(files)} image(s) ...")
+
+    for filename in files:
+        img = Image.open(os.path.join(INPUT_DIR, filename)).convert("RGB")
+        name = stem(filename)
+
+        if box:
+            x, y, w, h = box
+            roi = img.crop((x, y, x + w, y + h))
+            roi_desc = f"({x},{y},{w}x{h})"
+        else:
+            x1, y1, x2, y2 = _auto_detect_roi(img)
+            roi = img.crop((x1, y1, x2, y2))
+            roi_desc = f"auto({x1},{y1},{x2 - x1}x{y2 - y1})"
+
+        resized = roi.resize((target_w, target_h), interp)
+        out_name = f"{name}_roi.png"
+        resized.save(os.path.join(OUTPUT_DIR, out_name))
+        print(f"  {filename} {roi_desc} -> {target_w}x{target_h}")
 
     print("Done.")
 
@@ -179,11 +305,31 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # resize
-    p_resize = subparsers.add_parser("resize", help="Resize images to target dimensions.")
+    # resize (Strategy 3: full-image resize with explicit interpolation)
+    p_resize = subparsers.add_parser("resize", help="Resize full images with Lanczos/Bicubic interpolation.")
     p_resize.add_argument("width", type=int, help="Target width in pixels")
     p_resize.add_argument("height", type=int, help="Target height in pixels")
+    p_resize.add_argument("--interpolation", choices=["lanczos", "bicubic"], default="lanczos",
+                          help="Interpolation method (default: lanczos)")
     p_resize.set_defaults(func=cmd_resize)
+
+    # tile (Strategy 1: overlapping patches at native resolution)
+    p_tile = subparsers.add_parser("tile", help="Slice images into overlapping patches at native resolution.")
+    p_tile.add_argument("width", type=int, help="Patch width in pixels (e.g. 1024)")
+    p_tile.add_argument("height", type=int, help="Patch height in pixels (e.g. 1024)")
+    p_tile.add_argument("--overlap", type=float, default=0.15,
+                        help="Overlap fraction between tiles, 0.0-0.5 (default: 0.15)")
+    p_tile.set_defaults(func=cmd_tile)
+
+    # roi (Strategy 2: crop to ROI then resize)
+    p_roi = subparsers.add_parser("roi", help="Crop to region of interest, then resize.")
+    p_roi.add_argument("width", type=int, help="Target output width in pixels")
+    p_roi.add_argument("height", type=int, help="Target output height in pixels")
+    p_roi.add_argument("--box", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
+                       help="Manual ROI as x y w h. If omitted, auto-detects foreground.")
+    p_roi.add_argument("--interpolation", choices=["lanczos", "bicubic"], default="lanczos",
+                       help="Interpolation method (default: lanczos)")
+    p_roi.set_defaults(func=cmd_roi)
 
     # augment
     p_aug = subparsers.add_parser("augment", help="Generate augmented copies of each image.")
