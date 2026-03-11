@@ -5,8 +5,12 @@ Preprocessing CLI for segmentation datasets. Resize, tile, crop ROI, rotate, and
 ## Folder Structure
 
 ```
-preprocess_images/      # input images
-processed_images/       # output images
+preprocess_images/              # input images
+processed_images_resize/        # output from resize
+processed_images_tile/          # output from tile
+processed_images_roi/           # output from roi
+processed_images_augment/       # output from augment
+processed_images_rotate/        # output from rotate
 ```
 
 Supported formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.tiff`, `.webp`
@@ -26,9 +30,12 @@ Slice large images into overlapping patches at native resolution. No downsamplin
 ```bash
 python resize.py tile <patch_width> <patch_height>
 python resize.py tile 1024 1024 --overlap 0.15
+python resize.py tile 1024 1024 --overlap 0.2 --compress-level 1 --workers 8
 ```
 
 - `--overlap` — fraction of overlap between adjacent tiles, 0.0–0.5 (default: 0.15)
+- `--compress-level` — PNG compression level 0–9, lower is faster (default: 1). All levels are lossless
+- `--workers` — number of parallel save threads (default: 4)
 - Edge patches are automatically included so no pixels are lost
 - Output filenames: `{name}_tile{i}.png`
 

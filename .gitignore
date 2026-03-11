@@ -9,7 +9,7 @@ venv/
 
 # Images - input and output directories
 preprocess_images/
-processed_images/
+processed_images_*/
 
 # IDE
 .vscode/

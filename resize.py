@@ -1,12 +1,19 @@
 import os
 import argparse
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 
 INPUT_DIR = "preprocess_images"
-OUTPUT_DIR = "processed_images"
+OUTPUT_DIRS = {
+    "resize":  "processed_images_resize",
+    "tile":    "processed_images_tile",
+    "roi":     "processed_images_roi",
+    "augment": "processed_images_augment",
+    "rotate":  "processed_images_rotate",
+}
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
 
@@ -85,7 +92,8 @@ INTERPOLATION_METHODS = {
 def cmd_resize(args):
     target_w, target_h = args.width, args.height
     interp = INTERPOLATION_METHODS[args.interpolation]
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = OUTPUT_DIRS["resize"]
+    os.makedirs(out_dir, exist_ok=True)
 
     files = get_image_files(INPUT_DIR)
     if not files:
@@ -98,22 +106,42 @@ def cmd_resize(args):
         img = Image.open(os.path.join(INPUT_DIR, filename)).convert("RGB")
         resized = img.resize((target_w, target_h), interp)
         out_name = f"{stem(filename)}.png"
-        resized.save(os.path.join(OUTPUT_DIR, out_name))
+        resized.save(os.path.join(out_dir, out_name))
         print(f"  {filename}  {img.size[0]}x{img.size[1]} -> {target_w}x{target_h}")
 
-    print("Done.")
+    print(f"Done. Output in '{out_dir}/'.")
 
 
 # ---------------------------------------------------------------------------
 # Subcommand: tile (Strategy 1 – overlapping patches at native resolution)
 # ---------------------------------------------------------------------------
 
+def _compute_tile_origins(img_size, patch_size, stride):
+    """Return a list of start positions along one axis, including an edge tile if needed."""
+    length, patch_len, step = img_size, patch_size, stride
+    origins = list(range(0, length - patch_len + 1, step))
+    # add edge tile when the last regular tile doesn't reach the end
+    if origins and (origins[-1] + patch_len) < length:
+        origins.append(length - patch_len)
+    # handle case where image is smaller than patch
+    if not origins and length >= patch_len:
+        origins.append(0)
+    return origins
+
+
+def _save_tile(arr_slice, path, compress_level):
+    Image.fromarray(arr_slice).save(path, compress_level=compress_level)
+
+
 def cmd_tile(args):
     patch_w, patch_h = args.width, args.height
     overlap = args.overlap
+    compress = args.compress_level
+    workers = args.workers
     stride_w = int(patch_w * (1 - overlap))
     stride_h = int(patch_h * (1 - overlap))
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = OUTPUT_DIRS["tile"]
+    os.makedirs(out_dir, exist_ok=True)
 
     files = get_image_files(INPUT_DIR)
     if not files:
@@ -121,46 +149,37 @@ def cmd_tile(args):
         return
 
     print(f"Tiling {len(files)} image(s) into {patch_w}x{patch_h} patches "
-          f"(overlap {overlap:.0%}, stride {stride_w}x{stride_h}) ...")
+          f"(overlap {overlap:.0%}, stride {stride_w}x{stride_h}, "
+          f"compress {compress}, workers {workers}) ...")
 
     total_patches = 0
     for filename in files:
         img = Image.open(os.path.join(INPUT_DIR, filename)).convert("RGB")
         img_w, img_h = img.size
+        arr = np.array(img)
         name = stem(filename)
-        patch_idx = 0
 
-        y = 0
-        while y + patch_h <= img_h:
-            x = 0
-            while x + patch_w <= img_w:
-                patch = img.crop((x, y, x + patch_w, y + patch_h))
-                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
-                patch_idx += 1
-                x += stride_w
-            # right-edge patch if the image doesn't divide evenly
-            if x < img_w and (x - stride_w + patch_w) < img_w:
-                patch = img.crop((img_w - patch_w, y, img_w, y + patch_h))
-                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
-                patch_idx += 1
-            y += stride_h
-        # bottom-edge row
-        if y < img_h and (y - stride_h + patch_h) < img_h:
-            x = 0
-            while x + patch_w <= img_w:
-                patch = img.crop((x, img_h - patch_h, x + patch_w, img_h))
-                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
-                patch_idx += 1
-                x += stride_w
-            if x < img_w and (x - stride_w + patch_w) < img_w:
-                patch = img.crop((img_w - patch_w, img_h - patch_h, img_w, img_h))
-                patch.save(os.path.join(OUTPUT_DIR, f"{name}_tile{patch_idx}.png"))
-                patch_idx += 1
+        x_origins = _compute_tile_origins(img_w, patch_w, stride_w)
+        y_origins = _compute_tile_origins(img_h, patch_h, stride_h)
 
-        total_patches += patch_idx
-        print(f"  {filename} ({img_w}x{img_h}) -> {patch_idx} tiles")
+        tiles = []
+        for y in y_origins:
+            for x in x_origins:
+                tiles.append((x, y))
 
-    print(f"Done. {total_patches} tiles written to '{OUTPUT_DIR}/'.")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = []
+            for idx, (x, y) in enumerate(tiles):
+                tile_arr = arr[y:y + patch_h, x:x + patch_w]
+                path = os.path.join(out_dir, f"{name}_tile{idx}.png")
+                futures.append(pool.submit(_save_tile, tile_arr, path, compress))
+            for f in futures:
+                f.result()
+
+        total_patches += len(tiles)
+        print(f"  {filename} ({img_w}x{img_h}) -> {len(tiles)} tiles")
+
+    print(f"Done. {total_patches} tiles written to '{out_dir}/'.")
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +211,8 @@ def cmd_roi(args):
     target_w, target_h = args.width, args.height
     interp = INTERPOLATION_METHODS[args.interpolation]
     box = args.box
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = OUTPUT_DIRS["roi"]
+    os.makedirs(out_dir, exist_ok=True)
 
     files = get_image_files(INPUT_DIR)
     if not files:
@@ -217,10 +237,10 @@ def cmd_roi(args):
 
         resized = roi.resize((target_w, target_h), interp)
         out_name = f"{name}_roi.png"
-        resized.save(os.path.join(OUTPUT_DIR, out_name))
+        resized.save(os.path.join(out_dir, out_name))
         print(f"  {filename} {roi_desc} -> {target_w}x{target_h}")
 
-    print("Done.")
+    print(f"Done. Output in '{out_dir}/'.")
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +251,8 @@ def cmd_augment(args):
     target_w, target_h = args.width, args.height
     count = args.count
     seed = args.seed
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = OUTPUT_DIRS["augment"]
+    os.makedirs(out_dir, exist_ok=True)
 
     files = get_image_files(INPUT_DIR)
     if not files:
@@ -258,12 +279,12 @@ def cmd_augment(args):
                 aug_img = transform(aug_img)
 
             aug_img = aug_img.resize((target_w, target_h), Image.LANCZOS)
-            aug_img.save(os.path.join(OUTPUT_DIR, f"{name}_aug{i}.png"))
+            aug_img.save(os.path.join(out_dir, f"{name}_aug{i}.png"))
 
         print(f"  {filename} -> {count} augmented copies")
 
     total = len(files) * count
-    print(f"Done. {total} augmented images written to '{OUTPUT_DIR}/'.")
+    print(f"Done. {total} augmented images written to '{out_dir}/'.")
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +294,8 @@ def cmd_augment(args):
 def cmd_rotate(args):
     target_w, target_h = args.width, args.height
     angle = args.angle
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = OUTPUT_DIRS["rotate"]
+    os.makedirs(out_dir, exist_ok=True)
 
     files = get_image_files(INPUT_DIR)
     if not files:
@@ -289,10 +311,10 @@ def cmd_rotate(args):
         rotated = img.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=(0, 0, 0))
         rotated = rotated.resize((target_w, target_h), Image.LANCZOS)
         out_name = f"{name}_rot{angle}.png"
-        rotated.save(os.path.join(OUTPUT_DIR, out_name))
+        rotated.save(os.path.join(out_dir, out_name))
         print(f"  {filename} -> {out_name}")
 
-    print("Done.")
+    print(f"Done. Output in '{out_dir}/'.")
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +341,10 @@ def main():
     p_tile.add_argument("height", type=int, help="Patch height in pixels (e.g. 1024)")
     p_tile.add_argument("--overlap", type=float, default=0.15,
                         help="Overlap fraction between tiles, 0.0-0.5 (default: 0.15)")
+    p_tile.add_argument("--compress-level", type=int, default=1, choices=range(0, 10),
+                        metavar="0-9", help="PNG compress level, 0=fastest 9=smallest (default: 1)")
+    p_tile.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel save threads (default: 4)")
     p_tile.set_defaults(func=cmd_tile)
 
     # roi (Strategy 2: crop to ROI then resize)
